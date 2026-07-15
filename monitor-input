@@ -1,0 +1,951 @@
+#!/usr/bin/env bash
+#
+# monitor-input — Switch monitor video input via DDC/CI
+#
+# Runs on macOS or Linux. Backend is chosen automatically:
+#   macOS (local)  → m1ddc
+#   Linux (local)  → ddcutil
+#   macOS --via    → ddcutil over SSH on a remote Linux host
+#
+# Usage (any machine that is the active monitor input):
+#   monitor-input dp2                  Switch Xiaomi (default) to DP2
+#   monitor-input --monitor lg dp1     Switch LG monitor
+#
+# On Ubuntu when Linux is the active input (run directly, no SSH):
+#   monitor-input dp1
+#   monitor-input current
+#
+# From Mac when Linux is the active input (Mac cannot send DDC locally):
+#   monitor-input --via sangt@ubuntu-pc dp1
+
+set -euo pipefail
+
+VERSION="1.1.0"
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+MONITOR_PROFILE="${MONITOR_PROFILE:-xiaomi}"
+MONITOR_EXPLICIT=0
+MONITOR_REMOTE_SCRIPT="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+MONITOR_REMOTE_DDCUTIL="${MONITOR_REMOTE_DDCUTIL:-}"
+
+SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
+VCP_INPUT="${VCP_INPUT:-60}"
+REMOTE_HOST="${MONITOR_REMOTE_HOST:-}"
+
+JSON_MODE=0
+QUIET=0
+VIA_HOST=""
+VIA_FLAG=0
+DRY_RUN=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m'
+  YELLOW=$'\033[33m' BLUE=$'\033[34m' MAGENTA=$'\033[35m' CYAN=$'\033[36m' RESET=$'\033[0m'
+else
+  BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" RESET=""
+fi
+
+tolower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}
+  printf '%s' "$s"
+}
+
+die() {
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$*")"
+  else
+    printf "%s✗ %s%s\n" "$RED" "$*" "$RESET" >&2
+  fi
+  exit 1
+}
+
+info() { [[ "$QUIET" -eq 1 ]] && return; printf "%s%s%s\n" "$BLUE" "$*" "$RESET"; }
+ok()   { [[ "$QUIET" -eq 1 ]] && return; printf "%s%s%s\n" "$GREEN" "$*" "$RESET"; }
+warn() { [[ "$QUIET" -eq 1 ]] && return; printf "%s%s%s\n" "$YELLOW" "$*" "$RESET"; }
+
+normalize_hex() {
+  local v="${1#0x}"; v="${v#0X}"
+  printf '0x%02x' "0x$v"
+}
+
+# ── Monitor profiles ──────────────────────────────────────────────────────────
+
+profile_name() {
+  case "$(tolower "$MONITOR_PROFILE")" in
+    xiaomi|mi) printf 'Xiaomi Mi Monitor' ;;
+    lg)        printf 'LG IPS QHD' ;;
+    *)         printf '%s' "$MONITOR_PROFILE" ;;
+  esac
+}
+
+profile_normalize() {
+  case "$(tolower "$1")" in
+    xiaomi|mi|xiaomi-mi) printf 'xiaomi' ;;
+    lg|lg-ips)           printf 'lg' ;;
+    *)                   printf '%s' "$(tolower "$1")" ;;
+  esac
+}
+
+profile_m1ddc_display() {
+  case "$(tolower "$MONITOR_PROFILE")" in
+    lg) printf '%s' "${M1DDC_DISPLAY_LG:-3}" ;;
+    *)  printf '%s' "${M1DDC_DISPLAY_XIAOMI:-1}" ;;
+  esac
+}
+
+profile_ddcutil_display() {
+  case "$(tolower "$MONITOR_PROFILE")" in
+    lg) printf '%s' "${DDCUTIL_DISPLAY_LG:-2}" ;;
+    *)  printf '%s' "${DDCUTIL_DISPLAY_XIAOMI:-1}" ;;
+  esac
+}
+
+profile_m1ddc_input_cmd() {
+  case "$(tolower "$MONITOR_PROFILE")" in
+    lg) printf 'input-alt' ;;   # LG uses alternate addressing on m1ddc
+    *)  printf 'input' ;;
+  esac
+}
+
+# ddcutil / MCCS hex values (same for both monitors on Linux)
+input_hex() {
+  case "$(tolower "$1")" in
+    vga1)  printf '0x01' ;;
+    vga2)  printf '0x02' ;;
+    dvi1)  printf '0x03' ;;
+    dvi2)  printf '0x04' ;;
+    dp1)   printf '0x0f' ;;
+    dp2)   printf '0x10' ;;
+    hdmi1) printf '0x11' ;;
+    hdmi2) printf '0x12' ;;
+    usbc)  printf '0x00' ;;
+    *)     return 1 ;;
+  esac
+}
+
+# m1ddc decimal values (profile-specific for LG)
+input_m1ddc_value() {
+  local name; name="$(tolower "$1")"
+  if [[ "$(tolower "$MONITOR_PROFILE")" == "lg" ]]; then
+    case "$name" in
+      dp1)   printf '208' ;;
+      dp2)   printf '209' ;;
+      hdmi1) printf '144' ;;
+      hdmi2) printf '145' ;;
+      usbc)  printf '210' ;;
+      *)     return 1 ;;
+    esac
+  else
+    case "$name" in
+      dp1)   printf '15' ;;
+      dp2)   printf '16' ;;
+      hdmi1) printf '17' ;;
+      hdmi2) printf '18' ;;
+      usbc)  printf '27' ;;
+      *)     return 1 ;;
+    esac
+  fi
+}
+
+input_label() {
+  case "$(tolower "$1")" in
+    vga1)  printf 'VGA 1' ;;
+    vga2)  printf 'VGA 2' ;;
+    dvi1)  printf 'DVI 1' ;;
+    dvi2)  printf 'DVI 2' ;;
+    dp1)   printf 'DisplayPort 1' ;;
+    dp2)   printf 'DisplayPort 2' ;;
+    hdmi1) printf 'HDMI 1' ;;
+    hdmi2) printf 'HDMI 2' ;;
+    usbc)  printf 'USB-C' ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+hex_to_alias() {
+  case "$(normalize_hex "$1")" in
+    0x01) printf 'vga1' ;;
+    0x02) printf 'vga2' ;;
+    0x03) printf 'dvi1' ;;
+    0x04) printf 'dvi2' ;;
+    0x0f) printf 'dp1' ;;
+    0x10) printf 'dp2' ;;
+    0x11) printf 'hdmi1' ;;
+    0x12) printf 'hdmi2' ;;
+    0x00) printf 'usbc' ;;
+    *)    printf '%s' "$(normalize_hex "$1")" ;;
+  esac
+}
+
+m1ddc_value_to_alias() {
+  local profile; profile="$(tolower "$MONITOR_PROFILE")"
+  local v=$1 alias=""
+  case "$v" in
+    15) alias=dp1 ;;
+    16) alias=dp2 ;;
+    17) alias=hdmi1 ;;
+    18) alias=hdmi2 ;;
+    27) alias=usbc ;;
+  esac
+  if [[ -n "$alias" ]]; then
+    printf '%s' "$alias"
+    return
+  fi
+  if [[ "$profile" == "lg" ]]; then
+    case "$v" in
+      208) printf 'dp1' ;;
+      209) printf 'dp2' ;;
+      144) printf 'hdmi1' ;;
+      145) printf 'hdmi2' ;;
+      210) printf 'usbc' ;;
+      *)   printf '%s' "$v" ;;
+    esac
+  else
+    printf '%s' "$v"
+  fi
+}
+
+all_monitor_profiles() {
+  printf '%s\n' xiaomi lg
+}
+
+all_input_names() {
+  printf '%s\n' dp1 dp2 hdmi1 hdmi2 usbc
+}
+
+load_config() {
+  local candidates=()
+  [[ -n "${MONITOR_INPUT_CONFIG:-}" ]] && candidates+=("$MONITOR_INPUT_CONFIG")
+  candidates+=(
+    "$SCRIPT_DIR/monitor-input.conf"
+    "${XDG_CONFIG_HOME:-$HOME/.config}/monitor-input/config"
+    "$HOME/.monitor-input.conf"
+  )
+  local path
+  for path in "${candidates[@]}"; do
+    [[ -f "$path" ]] || continue
+    # shellcheck source=/dev/null
+    source "$path"
+    MONITOR_PROFILE="$(profile_normalize "$MONITOR_PROFILE")"
+    return 0
+  done
+  MONITOR_PROFILE="$(profile_normalize "$MONITOR_PROFILE")"
+}
+
+get_backend() {
+  if [[ -n "$VIA_HOST" ]]; then
+    printf 'ddcutil'
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    printf 'm1ddc'
+  else
+    printf 'ddcutil'
+  fi
+}
+
+require_backend() {
+  local backend; backend="$(get_backend)"
+  if [[ "$backend" == "m1ddc" ]]; then
+    command -v m1ddc >/dev/null 2>&1 \
+      || die "m1ddc not found. Install: brew install m1ddc"
+  else
+    if [[ -n "$VIA_HOST" ]]; then
+      via_preflight
+    else
+      command -v ddcutil >/dev/null 2>&1 \
+        || die "ddcutil not found. Install: sudo apt install ddcutil"
+    fi
+  fi
+}
+
+via_ssh() {
+  ssh "${SSH_OPTS[@]}" "$VIA_HOST" "$@"
+}
+
+# Embedded in remote bash -s scripts (non-interactive SSH skips .profile / linuxbrew PATH)
+remote_shell_header() {
+  cat <<'EOF'
+remote_find_ddcutil() {
+  if [[ -n "${MONITOR_REMOTE_DDCUTIL:-}" && -x "${MONITOR_REMOTE_DDCUTIL}" ]]; then
+    printf '%s\n' "$MONITOR_REMOTE_DDCUTIL"
+    return 0
+  fi
+  if [[ -x /home/linuxbrew/.linuxbrew/bin/brew ]]; then
+    eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+  elif [[ -x "$HOME/.linuxbrew/bin/brew" ]]; then
+    eval "$("$HOME/.linuxbrew/bin/brew" shellenv)"
+  fi
+  for d in \
+    "$HOME/.linuxbrew/bin" \
+    "/home/linuxbrew/.linuxbrew/bin" \
+    "/home/linuxbrew/.linuxbrew/sbin" \
+    /usr/local/bin /usr/bin; do
+    [[ -d "$d" ]] && PATH="$d:$PATH"
+  done
+  export PATH
+  if command -v ddcutil >/dev/null 2>&1; then
+    command -v ddcutil
+    return 0
+  fi
+  for p in \
+    "$HOME/.linuxbrew/bin/ddcutil" \
+    "/home/linuxbrew/.linuxbrew/bin/ddcutil" \
+    /usr/bin/ddcutil; do
+    if [[ -x "$p" ]]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+EOF
+}
+
+via_ssh_remote() {
+  via_ssh env MONITOR_REMOTE_DDCUTIL="${MONITOR_REMOTE_DDCUTIL}" bash -s -- "$@"
+}
+
+via_test_ssh() {
+  via_ssh 'echo ok' >/dev/null 2>&1
+}
+
+via_offer_ssh_key_setup() {
+  [[ "$JSON_MODE" -eq 1 || "$QUIET" -eq 1 ]] && return 1
+  [[ -t 0 && -t 1 ]] || return 1
+
+  printf "\n"
+  warn "SSH key auth failed for ${BOLD}${VIA_HOST}${RESET}."
+  warn "--via needs passwordless SSH (Apple Shortcuts cannot enter a password)."
+  printf "\n"
+  printf "  Install your SSH public key on %s? [y/N] " "$VIA_HOST"
+  local ans
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || return 1
+
+  command -v ssh-copy-id >/dev/null 2>&1 \
+    || die "ssh-copy-id not found. Install OpenSSH, then run: ssh-copy-id $VIA_HOST"
+
+  printf "\n"
+  info "Running: ssh-copy-id $VIA_HOST"
+  info "You will be prompted for your remote password once."
+  printf "\n"
+  if ! ssh-copy-id "$VIA_HOST"; then
+    die "ssh-copy-id failed. Try manually: ssh-copy-id $VIA_HOST"
+  fi
+
+  ok "SSH key installed."
+  if via_test_ssh; then
+    ok "Connection verified."
+    printf "\n"
+    return 0
+  fi
+
+  die "Key was copied but SSH still failed. Check: ssh $VIA_HOST"
+}
+
+via_preflight() {
+  local err rc=0 remote_script
+  remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+
+  if ! via_test_ssh; then
+    err="$(via_ssh 'echo ok' 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 && "$err" == *"Permission denied"* ]]; then
+      if via_offer_ssh_key_setup; then
+        : # verified inside offer
+      else
+        die "SSH to $VIA_HOST requires a key. Run: ssh-copy-id $VIA_HOST"
+      fi
+    else
+      die "Cannot SSH to $VIA_HOST: ${err:-exit $rc}"
+    fi
+  fi
+
+  rc=0
+  err="$(via_ssh_remote "$remote_script" <<EOF 2>&1
+$(remote_shell_header)
+script=\$1
+script="\${script/#\\~/\$HOME}"
+if ddc=\$(remote_find_ddcutil); then
+  exit 0
+fi
+if [[ -x "\$script" ]]; then
+  exit 0
+fi
+echo "missing tools (ddcutil not in PATH; try MONITOR_REMOTE_DDCUTIL in config)" >&2
+exit 127
+EOF
+)" || rc=$?
+
+  if [[ "$rc" -ne 0 ]]; then
+    die "$(via_remote_missing_message)"
+  fi
+}
+
+via_remote_missing_message() {
+  local remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+  cat <<EOF
+Remote $VIA_HOST needs ddcutil or monitor-input.
+
+  # Homebrew on Linux (your path):
+  MONITOR_REMOTE_DDCUTIL="/home/linuxbrew/.linuxbrew/bin/ddcutil"
+
+  # or apt:
+  sudo apt install ddcutil
+
+  # or deploy this script on Linux:
+  $remote_script
+
+Also set up passwordless SSH (or re-run --via in a terminal to install interactively):
+  ssh-copy-id $VIA_HOST
+EOF
+}
+
+via_switch_input() {
+  local alias=$1 remote_script mflag=""
+  remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+  [[ "$MONITOR_EXPLICIT" -eq 1 ]] && mflag="-m $MONITOR_PROFILE"
+
+  via_ssh_remote "$remote_script" "$MONITOR_PROFILE" "$alias" "$mflag" <<EOF
+$(remote_shell_header)
+script=\$1
+profile=\$2
+alias=\$3
+mflag=\$4
+script="\${script/#\\~/\$HOME}"
+export MONITOR_PROFILE="\$profile"
+if [[ -x "\$script" ]]; then
+  exec "\$script" -q \$mflag "\$alias"
+fi
+if ddc=\$(remote_find_ddcutil); then
+  display=1
+  [[ "\$profile" == "lg" ]] && display=2
+  case "\$alias" in
+    dp1)   val=0x0f ;;
+    dp2)   val=0x10 ;;
+    hdmi1) val=0x11 ;;
+    hdmi2) val=0x12 ;;
+    usbc)  val=0x00 ;;
+    *) exit 1 ;;
+  esac
+  exec "\$ddc" -d "\$display" setvcp 60 "\$val"
+fi
+echo "Need ddcutil or \$script on remote" >&2
+exit 127
+EOF
+}
+
+ddcutil_cmd() {
+  local display; display="$(profile_ddcutil_display)"
+  if [[ -n "$VIA_HOST" ]]; then
+    via_ssh_remote "$display" "$@" <<EOF
+$(remote_shell_header)
+display=\$1
+shift
+if ddc=\$(remote_find_ddcutil); then
+  exec "\$ddc" -d "\$display" "\$@"
+fi
+echo "ddcutil not found on remote (set MONITOR_REMOTE_DDCUTIL in config)" >&2
+exit 127
+EOF
+  else
+    ddcutil -d "$display" "$@"
+  fi
+}
+
+m1ddc_cmd() {
+  local display input_cmd
+  display="$(profile_m1ddc_display)"
+  m1ddc display "$display" "$@"
+}
+
+resolve_input() {
+  local name; name="$(tolower "$1")"
+  input_hex "$name" >/dev/null 2>&1 || die "Unknown input '$1'. Run: $SCRIPT_NAME list"
+  printf '%s' "$name"
+}
+
+is_input_or_command() {
+  case "$(tolower "$1")" in
+    current|list|detect|monitors|help) return 0 ;;
+    dp1|dp2|hdmi1|hdmi2|usbc|vga1|vga2|dvi1|dvi2) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+need_opt_arg() {
+  local opt=$1 val=${2:-}
+  [[ -n "$val" ]] || die "$opt requires an argument"
+}
+
+platform_label() {
+  if [[ -n "$VIA_HOST" ]]; then
+    printf 'macOS → %s (SSH)' "$VIA_HOST"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    printf 'macOS (local)'
+  else
+    printf 'Linux (local)'
+  fi
+}
+
+switch_failure_hint() {
+  if [[ "$(uname -s)" == "Darwin" && -z "$VIA_HOST" ]]; then
+    printf '%s' "Run on Linux directly, or from Mac use: --via user@linux-host"
+  else
+    printf '%s' "Ensure this machine is the currently active monitor input"
+  fi
+}
+
+get_current() {
+  local backend err=0
+  backend="$(get_backend)"
+  if [[ "$backend" == "m1ddc" ]]; then
+    local val
+    val="$(m1ddc_cmd get input 2>/dev/null | tr -d '[:space:]')" || err=1
+    [[ -n "$val" && "$err" -eq 0 ]] || return 1
+    printf 'm1ddc:%s' "$val"
+  else
+    local raw out hex
+    out="$(ddcutil_cmd getvcp "$VCP_INPUT" 2>/dev/null)" || err=1
+    raw="$(printf '%s\n' "$out" | sed -n 's/.*current value = \([^,]*\).*/\1/p' | head -1)"
+    [[ -z "$raw" ]] && raw="$(printf '%s\n' "$out" | grep -oE '0x[0-9a-fA-F]+' | head -1)"
+    [[ -n "$raw" && "$err" -eq 0 ]] || return 1
+    hex="$(normalize_hex "$raw")"
+    printf 'ddcutil:%s' "$hex"
+  fi
+}
+
+query_profile_current() {
+  local profile=$1 saved current alias label value pname
+  saved="$MONITOR_PROFILE"
+  MONITOR_PROFILE="$profile"
+  pname="$(profile_name)"
+
+  if ! current="$(get_current)"; then
+    MONITOR_PROFILE="$saved"
+    printf 'fail|%s|%s\n' "$profile" "$pname"
+    return 1
+  fi
+
+  IFS='|' read -r alias label value _ <<< "$(describe_current "$current")"
+  MONITOR_PROFILE="$saved"
+  printf 'ok|%s|%s|%s|%s|%s\n' "$profile" "$pname" "$alias" "$label" "$value"
+}
+
+describe_current() {
+  local current="$1" backend="${current%%:*}" value="${current#*:}"
+  local alias label display_value
+  if [[ "$backend" == "m1ddc" ]]; then
+    alias="$(m1ddc_value_to_alias "$value")"
+    display_value="$value"
+  else
+    alias="$(hex_to_alias "$value")"
+    display_value="$value"
+  fi
+  label="$(input_label "$alias")"
+  printf '%s|%s|%s|%s' "$alias" "$label" "$display_value" "$backend"
+}
+
+dry_run_command() {
+  local alias=$1 backend display hex m1_val input_cmd remote_script mflag=""
+  backend="$(get_backend)"
+  if [[ -n "$VIA_HOST" ]]; then
+    remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+    [[ "$MONITOR_EXPLICIT" -eq 1 ]] && mflag="-m $MONITOR_PROFILE"
+    printf 'ssh %s %q -q %s %s' "$VIA_HOST" "$remote_script" "$mflag" "$alias"
+    return
+  fi
+  if [[ "$backend" == "m1ddc" ]]; then
+    display="$(profile_m1ddc_display)"
+    input_cmd="$(profile_m1ddc_input_cmd)"
+    m1_val="$(input_m1ddc_value "$alias")"
+    printf 'm1ddc display %s set %s %s' "$display" "$input_cmd" "$m1_val"
+  else
+    display="$(profile_ddcutil_display)"
+    hex="$(input_hex "$alias")"
+    printf 'ddcutil -d %s setvcp %s %s' "$display" "$VCP_INPUT" "$hex"
+  fi
+}
+
+backend_switch() {
+  local alias=$1 backend
+  backend="$(get_backend)"
+  if [[ -n "$VIA_HOST" ]]; then
+    via_switch_input "$alias"
+    return
+  fi
+  if [[ "$backend" == "m1ddc" ]]; then
+    local input_cmd val
+    input_cmd="$(profile_m1ddc_input_cmd)"
+    val="$(input_m1ddc_value "$alias")"
+    m1ddc_cmd set "$input_cmd" "$val"
+  else
+    local hex
+    hex="$(input_hex "$alias")"
+    ddcutil_cmd setvcp "$VCP_INPUT" "$hex"
+  fi
+}
+
+cmd_current() {
+  require_backend
+  local backend; backend="$(get_backend)"
+  local profiles=()
+
+  if [[ "$MONITOR_EXPLICIT" -eq 1 ]]; then
+    profiles+=("$MONITOR_PROFILE")
+  else
+    while IFS= read -r p; do profiles+=("$p"); done < <(all_monitor_profiles)
+  fi
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '{"ok":true,"command":"current","platform":"%s","backend":"%s","via":"%s","monitors":[' \
+      "$(json_escape "$(platform_label)")" "$backend" "${VIA_HOST:-local}"
+    local first=1 profile line status pname alias label value
+    for profile in "${profiles[@]}"; do
+      [[ "$first" -eq 1 ]] || printf ','
+      first=0
+      line="$(query_profile_current "$profile" || true)"
+      status="${line%%|*}"
+      if [[ "$status" == "ok" ]]; then
+        IFS='|' read -r _ _ pname alias label value <<< "$line"
+        printf '{"profile":"%s","monitor":"%s","alias":"%s","label":"%s","value":"%s","ok":true}' \
+          "$profile" "$(json_escape "$pname")" "$alias" "$(json_escape "$label")" "$value"
+      else
+        IFS='|' read -r _ _ pname <<< "$line"
+        printf '{"profile":"%s","monitor":"%s","ok":false,"error":"Could not read input"}' \
+          "$profile" "$(json_escape "$pname")"
+      fi
+    done
+    printf ']}\n'
+    return
+  fi
+
+  printf "\n"
+  printf "  %s┌─ Monitor Inputs ────────────────%s\n" "$CYAN" "$RESET"
+  printf "  %s│%s  Platform    %s%s%s\n" "$CYAN" "$RESET" "$DIM" "$(platform_label)" "$RESET"
+  printf "  %s│%s  Backend     %s%s%s\n" "$CYAN" "$RESET" "$DIM" "$backend" "$RESET"
+  [[ -n "$VIA_HOST" ]] && printf "  %s│%s  Via         %s%s%s\n" "$CYAN" "$RESET" "$DIM" "$VIA_HOST" "$RESET"
+  printf "  %s├────────────────────────────────%s\n" "$CYAN" "$RESET"
+
+  local profile line status alias label value
+  for profile in "${profiles[@]}"; do
+    line="$(query_profile_current "$profile" || true)"
+    status="${line%%|*}"
+    if [[ "$status" == "ok" ]]; then
+      IFS='|' read -r _ _ _ alias label value <<< "$line"
+      printf "  %s│%s  %-10s  %s%s%s  %s(%s)%s\n" \
+        "$CYAN" "$RESET" "$profile" "$GREEN" "$label" "$RESET" "$DIM" "$value" "$RESET"
+    else
+      printf "  %s│%s  %-10s  %s— could not read%s\n" "$CYAN" "$RESET" "$profile" "$DIM" "$RESET"
+    fi
+  done
+
+  if [[ "$MONITOR_EXPLICIT" -eq 0 && "$QUIET" -eq 0 ]]; then
+    printf "  %s│%s\n" "$CYAN" "$RESET"
+    printf "  %s│%s  %sTip:%s one monitor only → %s-m xiaomi current%s or %s-m lg current%s\n" \
+      "$CYAN" "$RESET" "$DIM" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  fi
+  printf "  %s└────────────────────────────────%s\n\n" "$CYAN" "$RESET"
+}
+
+list_profile_inputs() {
+  local profile=$1 saved pname backend display input_cmd
+  saved="$MONITOR_PROFILE"
+  MONITOR_PROFILE="$profile"
+  pname="$(profile_name)"
+  backend="$(get_backend)"
+  display="$(profile_m1ddc_display)"
+  [[ "$backend" == "ddcutil" ]] && display="$(profile_ddcutil_display)"
+  input_cmd="$(profile_m1ddc_input_cmd)"
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '{"profile":"%s","monitor":"%s","display":%s,"input_cmd":"%s","inputs":[' \
+      "$profile" "$(json_escape "$pname")" "$display" "$input_cmd"
+    local first=1 name hex label m1_val
+    while IFS= read -r name; do
+      hex="$(input_hex "$name")"
+      label="$(input_label "$name")"
+      m1_val="$(input_m1ddc_value "$name")"
+      [[ "$first" -eq 1 ]] || printf ','
+      first=0
+      printf '{"alias":"%s","label":"%s","hex":"%s","m1ddc":%s}' \
+        "$name" "$(json_escape "$label")" "$hex" "$m1_val"
+    done < <(all_input_names)
+    printf ']}'
+    MONITOR_PROFILE="$saved"
+    return
+  fi
+
+  printf "  %s┌─ %s ─────────%s\n" "$MAGENTA" "$pname" "$RESET"
+  if [[ "$backend" == "m1ddc" ]]; then
+    printf "  %s│%s  Profile: %s   Display: #%s   Cmd: %s\n" \
+      "$MAGENTA" "$RESET" "$profile" "$display" "$input_cmd"
+    printf "  %s│%s  %-10s  %-8s  %-6s  %s\n" "$MAGENTA" "$RESET" "NAME" "HEX" "M1DDC" "LABEL"
+  else
+    printf "  %s│%s  Profile: %s   Display: #%s\n" \
+      "$MAGENTA" "$RESET" "$profile" "$display"
+    printf "  %s│%s  %-10s  %-8s  %s\n" "$MAGENTA" "$RESET" "NAME" "HEX" "LABEL"
+  fi
+  printf "  %s├────────────────────────────────%s\n" "$MAGENTA" "$RESET"
+  local name hex label m1_val
+  while IFS= read -r name; do
+    hex="$(input_hex "$name")"
+    label="$(input_label "$name")"
+    if [[ "$backend" == "m1ddc" ]]; then
+      m1_val="$(input_m1ddc_value "$name")"
+      printf "  %s│%s  %-10s  %-8s  %-6s  %s\n" "$MAGENTA" "$RESET" "$name" "$hex" "$m1_val" "$label"
+    else
+      printf "  %s│%s  %-10s  %-8s  %s\n" "$MAGENTA" "$RESET" "$name" "$hex" "$label"
+    fi
+  done < <(all_input_names)
+  printf "  %s└────────────────────────────────%s\n\n" "$MAGENTA" "$RESET"
+  MONITOR_PROFILE="$saved"
+}
+
+cmd_list() {
+  local backend profiles=()
+  backend="$(get_backend)"
+
+  if [[ "$MONITOR_EXPLICIT" -eq 1 ]]; then
+    profiles+=("$MONITOR_PROFILE")
+  else
+    while IFS= read -r p; do profiles+=("$p"); done < <(all_monitor_profiles)
+  fi
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '{"ok":true,"command":"list","backend":"%s","monitors":[' "$backend"
+    local first=1 profile
+    for profile in "${profiles[@]}"; do
+      [[ "$first" -eq 1 ]] || printf ','
+      first=0
+      list_profile_inputs "$profile"
+    done
+    printf ']}\n'
+    return
+  fi
+
+  printf "\n"
+  local profile
+  for profile in "${profiles[@]}"; do
+    list_profile_inputs "$profile"
+  done
+  if [[ "$MONITOR_EXPLICIT" -eq 0 && "$QUIET" -eq 0 ]]; then
+    printf "  %sTip:%s one monitor only → %s-m xiaomi list%s or %s-m lg list%s\n\n" \
+      "$DIM" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  fi
+}
+
+cmd_detect() {
+  require_backend
+  local backend; backend="$(get_backend)"
+  printf "\n"
+  info "Detected displays (${backend}):"
+  printf "\n"
+  if [[ "$backend" == "m1ddc" ]]; then
+    m1ddc display list || die "m1ddc display list failed"
+  else
+    ddcutil_cmd detect || die "ddcutil detect failed"
+  fi
+  printf "\n"
+  if [[ "$backend" == "m1ddc" && "$QUIET" -eq 0 && "$JSON_MODE" -eq 0 ]]; then
+    printf "  %sTip:%s m1ddc display IDs — xiaomi: ${M1DDC_DISPLAY_XIAOMI:-1}, lg: ${M1DDC_DISPLAY_LG:-3}\n\n" "$DIM" "$RESET"
+  elif [[ "$backend" == "ddcutil" && -z "$VIA_HOST" && "$QUIET" -eq 0 && "$JSON_MODE" -eq 0 ]]; then
+    printf "  %sTip:%s ddcutil display IDs — xiaomi: ${DDCUTIL_DISPLAY_XIAOMI:-1}, lg: ${DDCUTIL_DISPLAY_LG:-2}\n\n" "$DIM" "$RESET"
+  fi
+}
+
+cmd_monitors() {
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '[{"profile":"xiaomi","name":"%s","default":true},{"profile":"lg","name":"%s","default":false}]\n' \
+      "$(json_escape "Xiaomi Mi Monitor")" "$(json_escape "LG IPS QHD")"
+    return
+  fi
+  printf "\n"
+  printf "  %s┌─ Monitor Profiles ──────────────%s\n" "$CYAN" "$RESET"
+  printf "  %s│%s  %-10s  %s\n" "$CYAN" "$RESET" "PROFILE" "MONITOR"
+  printf "  %s├────────────────────────────────%s\n" "$CYAN" "$RESET"
+  printf "  %s│%s  %-10s  %s (default)\n" "$CYAN" "$RESET" "xiaomi" "Xiaomi Mi Monitor"
+  printf "  %s│%s  %-10s  %s\n" "$CYAN" "$RESET" "lg" "LG IPS QHD"
+  printf "  %s└────────────────────────────────%s\n\n" "$CYAN" "$RESET"
+}
+
+cmd_switch() {
+  local target_name alias label cmd_str
+  target_name="$(resolve_input "$1")"
+  alias="$target_name"
+  label="$(input_label "$alias")"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    cmd_str="$(dry_run_command "$alias")"
+    if [[ "$JSON_MODE" -eq 1 ]]; then
+      printf '{"ok":true,"command":"switch","dry_run":true,"profile":"%s","target":"%s","label":"%s","run":"%s"}\n' \
+        "$MONITOR_PROFILE" "$alias" "$(json_escape "$label")" "$(json_escape "$cmd_str")"
+    else
+      warn "Dry run: $cmd_str"
+      [[ -n "$VIA_HOST" ]] && warn "Via: $VIA_HOST"
+    fi
+    return
+  fi
+
+  require_backend
+
+  if ! backend_switch "$alias" >/dev/null 2>&1; then
+    die "Failed to switch $label on $(profile_name). $(switch_failure_hint)."
+  fi
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf '{"ok":true,"command":"switch","profile":"%s","monitor":"%s","target":"%s","label":"%s","backend":"%s","via":"%s"}\n' \
+      "$MONITOR_PROFILE" "$(json_escape "$(profile_name)")" "$alias" \
+      "$(json_escape "$label")" "$(get_backend)" "${VIA_HOST:-local}"
+    return
+  fi
+
+  printf "\n"
+  ok "$(profile_name) → ${BOLD}${label}${RESET}"
+  info "Platform: $(platform_label)  Backend: $(get_backend)"
+  [[ -n "$VIA_HOST" ]] && info "Sent via ${VIA_HOST}"
+  printf "\n"
+}
+
+print_banner() {
+  [[ "$QUIET" -eq 1 ]] && return
+  printf "\n"
+  printf "  %s╭──────────────────────────────────────╮%s\n" "$CYAN" "$RESET"
+  printf "  %s│%s  %sMonitor Input%s  %sv%s%s              %s│%s\n" \
+    "$CYAN" "$RESET" "$BOLD" "$RESET" "$DIM" "$VERSION" "$RESET" "$CYAN" "$RESET"
+  printf "  %s╰──────────────────────────────────────╯%s\n" "$CYAN" "$RESET"
+  printf "\n"
+}
+
+print_limitation_note() {
+  [[ "$QUIET" -eq 1 ]] && return
+  printf "  %sNote:%s DDC/CI only works from the %scurrently active%s video input.\n" "$DIM" "$RESET" "$BOLD" "$RESET"
+  printf "\n"
+  printf "  %sWhere to run:${RESET}\n"
+  printf "    Mac is active     → run on Mac:        %smonitor-input dp2%s\n" "$CYAN" "$RESET"
+  printf "    Linux is active   → run on Linux:      %smonitor-input dp1%s\n" "$CYAN" "$RESET"
+  printf "    From Mac, Linux   → SSH from Mac:      %smonitor-input --via user@ubuntu-pc dp1%s\n\n" "$CYAN" "$RESET"
+}
+
+usage() {
+  cat <<EOF
+${BOLD}${SCRIPT_NAME}${RESET} — Switch monitor input via DDC/CI (macOS or Linux)
+
+${BOLD}WHERE TO RUN${RESET}
+  Active input is Mac     Run locally on macOS (uses m1ddc)
+  Active input is Linux   Run locally on Linux (uses ddcutil)
+  From Mac, Linux active  Use --via to SSH into Linux and run ddcutil there
+
+${BOLD}USAGE${RESET}
+  ${SCRIPT_NAME} <input>              Switch input on default monitor (xiaomi)
+  ${SCRIPT_NAME} -m lg <input>        Switch input on LG monitor
+  ${SCRIPT_NAME} current|list|detect|monitors
+  ${SCRIPT_NAME} -m lg list              # one monitor only
+
+${BOLD}INPUTS${RESET}  dp1, dp2, hdmi1, hdmi2, usbc
+
+${BOLD}OPTIONS${RESET}
+  -m, --monitor PROFILE   xiaomi (default) | lg
+  -d, --display N         Override display ID (legacy; prefer profile settings)
+  --via [HOST]              SSH to Linux (HOST from config if omitted)
+  --config PATH           Config file
+  --json                  JSON output (Apple Shortcuts / automation)
+  -q, --quiet             Minimal output
+  -n, --dry-run           Show command without running
+  -h, --help              Help
+
+${BOLD}EXAMPLES${RESET}
+  ${SCRIPT_NAME} dp2                         # on Mac, when Mac input is active
+  ${SCRIPT_NAME} dp1                         # on Linux, when Linux input is active
+  ${SCRIPT_NAME} -m lg hdmi1                 # LG monitor
+  ${SCRIPT_NAME} dp2 --via                   # uses MONITOR_REMOTE_HOST from config
+  ${SCRIPT_NAME} dp2 --via sangt@ubuntu-pc   # explicit host
+  ${SCRIPT_NAME} --json current              # all monitors (xiaomi + lg)
+  ${SCRIPT_NAME} -m xiaomi current            # one monitor only
+
+${BOLD}REMOTE SETUP${RESET} (for --via)
+  Run once in a terminal — the script will offer to install your SSH key if missing:
+  ./monitor-input dp1 --via sangt@ubuntu-pc
+  # or manually: ssh-copy-id sangt@ubuntu-pc
+  # on Ubuntu: sudo apt install ddcutil  (or sync this repo)
+
+${BOLD}BACKENDS${RESET}
+  macOS (local)       m1ddc     brew install m1ddc
+  Linux (local)       ddcutil   apt install ddcutil
+  macOS --via HOST    ddcutil   on the remote Linux machine
+
+${BOLD}CONFIG${RESET}  ${SCRIPT_DIR}/monitor-input.conf
+EOF
+}
+
+parse_args() {
+  local positional=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -V|--version) printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"; exit 0 ;;
+      -m|--monitor)
+        need_opt_arg "$1" "${2:-}"
+        MONITOR_PROFILE="$(profile_normalize "$2")"
+        MONITOR_EXPLICIT=1
+        shift 2
+        ;;
+      -d|--display)
+        need_opt_arg "$1" "${2:-}"
+        M1DDC_DISPLAY_XIAOMI="$2"
+        DDCUTIL_DISPLAY_XIAOMI="$2"
+        shift 2
+        ;;
+      --via|--remote)
+        VIA_FLAG=1
+        shift
+        if [[ $# -gt 0 && "$1" != -* ]] && ! is_input_or_command "$1"; then
+          VIA_HOST="$1"
+          shift
+        fi
+        ;;
+      --config)
+        need_opt_arg "$1" "${2:-}"
+        MONITOR_INPUT_CONFIG="$2"
+        shift 2
+        ;;
+      --json) JSON_MODE=1; QUIET=1; shift ;;
+      -q|--quiet) QUIET=1; shift ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      current|list|detect|monitors|help) positional+=("$1"); shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  load_config
+
+  if [[ "$VIA_FLAG" -eq 1 && -z "$VIA_HOST" ]]; then
+    if [[ -n "${MONITOR_REMOTE_HOST:-}" ]]; then
+      VIA_HOST="$MONITOR_REMOTE_HOST"
+    else
+      die "No remote host. Set MONITOR_REMOTE_HOST in config or use: --via user@host"
+    fi
+  fi
+
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    print_banner
+    print_limitation_note
+    usage
+    exit 0
+  fi
+
+  case "${positional[0]}" in
+    help) usage ;;
+    monitors) cmd_monitors ;;
+    list) cmd_list ;;
+    detect) cmd_detect ;;
+    current) cmd_current ;;
+    *) cmd_switch "${positional[0]}" ;;
+  esac
+}
+
+parse_args "$@"

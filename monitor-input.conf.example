@@ -1,0 +1,26 @@
+# monitor-input configuration
+# Copy to monitor-input.conf in this directory, or ~/.config/monitor-input/config
+
+MONITOR_PROFILE=xiaomi
+MONITOR_REMOTE_HOST="sangt@ubuntu-pc"
+
+# Path to this script on the Linux machine (used by --via from Mac)
+MONITOR_REMOTE_SCRIPT="~/dev/personal/toolbox/monitor-input"
+
+# Explicit ddcutil path on Linux (needed for Homebrew/Linuxbrew over SSH)
+MONITOR_REMOTE_DDCUTIL="/home/linuxbrew/.linuxbrew/bin/ddcutil"
+
+# ── Xiaomi Mi Monitor (default KVM display) ───────────────────────────────────
+M1DDC_DISPLAY_XIAOMI=1
+DDCUTIL_DISPLAY_XIAOMI=1
+
+# ── LG IPS QHD ───────────────────────────────────────────────────────────────
+M1DDC_DISPLAY_LG=3
+DDCUTIL_DISPLAY_LG=2
+
+VCP_INPUT=60
+
+# ── Remote setup (--via from Mac) ─────────────────────────────────────────────
+# 1. Passwordless SSH — run --via in a terminal; the script offers ssh-copy-id
+#    Or manually: ssh-copy-id sangt@ubuntu-pc
+# 2. On Ubuntu: sudo apt install ddcutil  OR sync this repo to Linux
