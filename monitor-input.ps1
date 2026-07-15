@@ -7,7 +7,7 @@
 
 param(
     [Parameter(Position = 0)]
-    [string]$Input
+    [string]$MonitorInput
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,14 +41,14 @@ Config (optional env vars):
 "@
 }
 
-if (-not $Input -or $Input -in @('-h', '--help', 'help')) {
+if (-not $MonitorInput -or $MonitorInput -in @('-h', '--help', 'help')) {
     Show-Usage
     exit 0
 }
 
-$name = $Input.ToLower()
+$name = $MonitorInput.ToLower()
 if (-not $Inputs.ContainsKey($name)) {
-    Write-Error "Unknown input '$Input'. Valid: $($Inputs.Keys -join ', ')"
+    Write-Error "Unknown input '$MonitorInput'. Valid: $($Inputs.Keys -join ', ')"
     exit 1
 }
 
@@ -70,4 +70,4 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "Switched to $Input ($value)"
+Write-Host "Switched to $MonitorInput ($value)"
