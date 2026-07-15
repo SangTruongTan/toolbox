@@ -471,6 +471,22 @@ EOF
   fi
 }
 
+# ddcutil subcommands that apply to all displays (no -d flag)
+ddcutil_global_cmd() {
+  if [[ -n "$VIA_HOST" ]]; then
+    via_ssh bash -s -- "$@" <<EOF
+$(remote_shell_header)
+if ddc=\$(remote_find_ddcutil); then
+  exec "\$ddc" "\$@"
+fi
+echo "ddcutil not found on remote (set MONITOR_REMOTE_DDCUTIL in config)" >&2
+exit 127
+EOF
+  else
+    ddcutil "$@"
+  fi
+}
+
 m1ddc_cmd() {
   local display input_cmd
   display="$(profile_m1ddc_display)"
@@ -762,7 +778,7 @@ cmd_detect() {
   if [[ "$backend" == "m1ddc" ]]; then
     m1ddc display list || die "m1ddc display list failed"
   else
-    ddcutil_cmd detect || die "ddcutil detect failed"
+    ddcutil_global_cmd detect || die "ddcutil detect failed"
   fi
   printf "\n"
   if [[ "$backend" == "m1ddc" && "$QUIET" -eq 0 && "$JSON_MODE" -eq 0 ]]; then
