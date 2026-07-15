@@ -141,8 +141,15 @@ install_deps_linux() {
     die "No package manager found. Install ddcutil manually or install Homebrew for Linux."
   fi
 
-  # I2C permissions (Debian/Ubuntu)
-  if getent group i2c >/dev/null 2>&1; then
+  # I2C permissions (Debian/Ubuntu) — udev rule + group i2c
+  local setup_i2c="${TOOLBOX_DIR}/setup-i2c-permissions.sh"
+  if [[ -x "$setup_i2c" ]]; then
+    if confirm "Configure /dev/i2c permissions for ddcutil?"; then
+      bash "$setup_i2c"
+    else
+      warn "Skipped i2c setup. If ddcutil fails with EACCES, run: $setup_i2c"
+    fi
+  elif getent group i2c >/dev/null 2>&1; then
     if groups "$USER" | grep -q '\bi2c\b'; then
       ok "User $USER is in group i2c"
     else
