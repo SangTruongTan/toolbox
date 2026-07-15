@@ -380,7 +380,7 @@ via_preflight() {
   fi
 
   rc=0
-  err="$(via_ssh_remote "$remote_script" <<EOF 2>&1
+  err=$(via_ssh_remote "$remote_script" <<EOF 2>&1
 $(remote_shell_header)
 script=\$1
 script="\${script/#\\~/\$HOME}"
@@ -393,7 +393,7 @@ fi
 echo "missing tools (ddcutil not in PATH; try MONITOR_REMOTE_DDCUTIL in config)" >&2
 exit 127
 EOF
-)" || rc=$?
+) || rc=$?
 
   if [[ "$rc" -ne 0 ]]; then
     die "$(via_remote_missing_message)"
