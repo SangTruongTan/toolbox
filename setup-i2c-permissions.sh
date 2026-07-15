@@ -96,6 +96,35 @@ cmd_diagnose() {
     echo "=== ddcutil detect ==="
     ddcutil detect 2>&1 | head -10
   fi
+  echo ""
+  echo "=== GPU / display driver (common cause of 'No displays found') ==="
+  local kernel; kernel="$(uname -r)"
+  echo "Kernel: $kernel"
+  if lspci -k -s "$(lspci -D | awk '/VGA|3D/ {print $1; exit}')" 2>/dev/null | grep -q 'simple-framebuffer\|vesafb'; then
+    echo "! Display may be on simple-framebuffer (wrong/low resolution, no DDC)"
+  fi
+  for gpu in $(lspci -D | awk '/VGA compatible controller|3D controller/ {print $1}'); do
+    echo "--- lspci -k -s $gpu ---"
+    lspci -k -s "$gpu" 2>/dev/null | sed -n '1,4p'
+  done
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi >/dev/null 2>&1; then
+      echo "✓ nvidia-smi OK"
+    else
+      echo "✗ nvidia-smi failed — NVIDIA driver not loaded for kernel $kernel"
+      echo "  Installed nvidia module packages:"
+      dpkg -l 'linux-modules-nvidia-*' 2>/dev/null | awk '/^ii/ {print "    "$2}' || true
+      echo "  Fix: sudo apt install linux-modules-nvidia-580-open-${kernel}"
+      echo "       sudo reboot"
+      echo "  Quick workaround: boot Advanced options → older kernel (e.g. 6.14.0-36)"
+    fi
+  fi
+  echo ""
+  echo "=== connected DRM outputs ==="
+  for f in /sys/class/drm/card*-*/status; do
+    [[ -e "$f" ]] || continue
+    printf '  %s: %s\n' "${f#/sys/class/drm/}" "$(cat "$f" 2>/dev/null)"
+  done
 }
 
 if [[ "$DIAGNOSE" -eq 1 ]]; then
