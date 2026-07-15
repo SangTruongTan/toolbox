@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MONITOR_PROFILE="${MONITOR_PROFILE:-xiaomi}"
 MONITOR_EXPLICIT=0
-MONITOR_REMOTE_SCRIPT="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+MONITOR_REMOTE_SCRIPT="${MONITOR_REMOTE_SCRIPT:-}"
 MONITOR_REMOTE_DDCUTIL="${MONITOR_REMOTE_DDCUTIL:-}"
 
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
@@ -47,6 +47,22 @@ else
 fi
 
 tolower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Path to monitor-input on the Linux host (--via runs commands there)
+default_remote_script() {
+  case "$(uname -s)" in
+    Linux) printf '%s/dev/toolbox/monitor-input' "$HOME" ;;
+    *)     printf '/home/sangt/dev/toolbox/monitor-input' ;;
+  esac
+}
+
+remote_script_path() {
+  if [[ -n "${MONITOR_REMOTE_SCRIPT:-}" ]]; then
+    printf '%s' "$MONITOR_REMOTE_SCRIPT"
+  else
+    default_remote_script
+  fi
+}
 
 json_escape() {
   local s=$1
@@ -348,7 +364,7 @@ via_offer_ssh_key_setup() {
 
 via_preflight() {
   local err rc=0 remote_script
-  remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+  remote_script="${MONITOR_REMOTE_SCRIPT:-$(remote_script_path)}"
 
   if ! via_test_ssh; then
     err="$(via_ssh 'echo ok' 2>&1)" || rc=$?
@@ -385,7 +401,7 @@ EOF
 }
 
 via_remote_missing_message() {
-  local remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+  local remote_script="${MONITOR_REMOTE_SCRIPT:-$(remote_script_path)}"
   cat <<EOF
 Remote $VIA_HOST needs ddcutil or monitor-input.
 
@@ -405,7 +421,7 @@ EOF
 
 via_switch_input() {
   local alias=$1 remote_script mflag=""
-  remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+  remote_script="${MONITOR_REMOTE_SCRIPT:-$(remote_script_path)}"
   [[ "$MONITOR_EXPLICIT" -eq 1 ]] && mflag="-m $MONITOR_PROFILE"
 
   via_ssh_remote "$remote_script" "$MONITOR_PROFILE" "$alias" "$mflag" <<EOF
@@ -552,7 +568,7 @@ dry_run_command() {
   local alias=$1 backend display hex m1_val input_cmd remote_script mflag=""
   backend="$(get_backend)"
   if [[ -n "$VIA_HOST" ]]; then
-    remote_script="${MONITOR_REMOTE_SCRIPT:-~/dev/personal/toolbox/monitor-input}"
+    remote_script="${MONITOR_REMOTE_SCRIPT:-$(remote_script_path)}"
     [[ "$MONITOR_EXPLICIT" -eq 1 ]] && mflag="-m $MONITOR_PROFILE"
     printf 'ssh %s %q -q %s %s' "$VIA_HOST" "$remote_script" "$mflag" "$alias"
     return

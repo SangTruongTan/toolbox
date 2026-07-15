@@ -194,7 +194,11 @@ write_config() {
 
   local os ddcutil_line remote_script_line
   os="$(detect_os)"
-  remote_script_line="MONITOR_REMOTE_SCRIPT=\"${TOOLBOX_DIR}/monitor-input\""
+  if [[ "$os" == "linux" ]]; then
+    remote_script_line="MONITOR_REMOTE_SCRIPT=\"${TOOLBOX_DIR}/monitor-input\""
+  else
+    remote_script_line='MONITOR_REMOTE_SCRIPT="/home/sangt/dev/toolbox/monitor-input"'
+  fi
 
   if [[ "$os" == "linux" ]]; then
     linuxbrew_shellenv
