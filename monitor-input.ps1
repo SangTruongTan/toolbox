@@ -1,4 +1,4 @@
-# monitor-input.ps1 — Switch monitor input on Windows (ControlMyMonitor)
+# monitor-input.ps1 - Switch monitor input on Windows (ControlMyMonitor)
 #
 # Setup:
 #   1. Download ControlMyMonitor to ~\dev\controlmymonitor\
@@ -27,7 +27,7 @@ $Inputs = @{
 function Show-Usage {
     Write-Host @"
 
-monitor-input.ps1 — Switch monitor input (Windows)
+monitor-input.ps1 - Switch monitor input (Windows)
 
 Usage:
   .\monitor-input.ps1 dp1
