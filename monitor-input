@@ -2,10 +2,11 @@
 #
 # monitor-input — Switch monitor video input via DDC/CI
 #
-# Runs on macOS or Linux. Backend is chosen automatically:
-#   macOS (local)  → m1ddc
-#   Linux (local)  → ddcutil
-#   macOS --via    → ddcutil over SSH on a remote Linux host
+# Runs on macOS, Linux, or Windows (Git Bash). Backend is chosen automatically:
+#   macOS (local)    → m1ddc
+#   Linux (local)    → ddcutil
+#   Windows (local)  → ControlMyMonitor (switch only)
+#   --via            → ddcutil over SSH on a remote Linux host
 #
 # Usage (any machine that is the active monitor input):
 #   monitor-input dp2                  Switch Xiaomi (default) to DP2
@@ -20,7 +21,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -28,6 +29,8 @@ MONITOR_PROFILE="${MONITOR_PROFILE:-xiaomi}"
 MONITOR_EXPLICIT=0
 MONITOR_REMOTE_SCRIPT="${MONITOR_REMOTE_SCRIPT:-}"
 MONITOR_REMOTE_DDCUTIL="${MONITOR_REMOTE_DDCUTIL:-}"
+CONTROLMYMONITOR_PATH="${CONTROLMYMONITOR_PATH:-}"
+CMM_MONITOR="${CMM_MONITOR:-Primary}"
 
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
 VCP_INPUT="${VCP_INPUT:-60}"
@@ -233,28 +236,63 @@ all_input_names() {
   printf '%s\n' dp1 dp2 hdmi1 hdmi2 usbc
 }
 
+is_windows() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+  esac
+  [[ "${OS:-}" == "Windows_NT" ]] && return 0
+  return 1
+}
+
+config_file_candidates() {
+  [[ -n "${MONITOR_INPUT_CONFIG:-}" ]] && printf '%s\n' "$MONITOR_INPUT_CONFIG"
+  printf '%s\n' "$SCRIPT_DIR/monitor-input.conf"
+  if is_windows; then
+    printf '%s\n' "${APPDATA:-$HOME/AppData/Roaming}/monitor-input/config"
+  else
+    printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/monitor-input/config"
+  fi
+  printf '%s\n' "$HOME/.monitor-input.conf"
+}
+
 load_config() {
-  local candidates=()
-  [[ -n "${MONITOR_INPUT_CONFIG:-}" ]] && candidates+=("$MONITOR_INPUT_CONFIG")
-  candidates+=(
-    "$SCRIPT_DIR/monitor-input.conf"
-    "${XDG_CONFIG_HOME:-$HOME/.config}/monitor-input/config"
-    "$HOME/.monitor-input.conf"
-  )
   local path
-  for path in "${candidates[@]}"; do
+  while IFS= read -r path; do
     [[ -f "$path" ]] || continue
     # shellcheck source=/dev/null
     source "$path"
     MONITOR_PROFILE="$(profile_normalize "$MONITOR_PROFILE")"
     return 0
-  done
+  done < <(config_file_candidates)
   MONITOR_PROFILE="$(profile_normalize "$MONITOR_PROFILE")"
+}
+
+find_cmm() {
+  local p
+  for p in \
+    "${CONTROLMYMONITOR_PATH:-}" \
+    "$HOME/ControlMyMonitor/ControlMyMonitor.exe" \
+    "$HOME/Downloads/ControlMyMonitor/ControlMyMonitor.exe" \
+    "/c/ControlMyMonitor/ControlMyMonitor.exe"; do
+    [[ -n "$p" && -f "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  command -v ControlMyMonitor.exe >/dev/null 2>&1 && { command -v ControlMyMonitor.exe; return 0; }
+  command -v ControlMyMonitor >/dev/null 2>&1 && { command -v ControlMyMonitor; return 0; }
+  return 1
+}
+
+cmm_switch() {
+  local alias=$1 val cmm
+  val="$(input_m1ddc_value "$alias")" || return 1
+  cmm="$(find_cmm)" || die "ControlMyMonitor not found. Set CONTROLMYMONITOR_PATH in config. Download: https://www.nirsoft.net/utils/control_my_monitor.html"
+  "$cmm" /SetValue "${CMM_MONITOR:-Primary}" "$VCP_INPUT" "$val"
 }
 
 get_backend() {
   if [[ -n "$VIA_HOST" ]]; then
     printf 'ddcutil'
+  elif is_windows; then
+    printf 'cmm'
   elif [[ "$(uname -s)" == "Darwin" ]]; then
     printf 'm1ddc'
   else
@@ -267,6 +305,9 @@ require_backend() {
   if [[ "$backend" == "m1ddc" ]]; then
     command -v m1ddc >/dev/null 2>&1 \
       || die "m1ddc not found. Install: brew install m1ddc"
+  elif [[ "$backend" == "cmm" ]]; then
+    find_cmm >/dev/null 2>&1 \
+      || die "ControlMyMonitor not found. Set CONTROLMYMONITOR_PATH. Download: https://www.nirsoft.net/utils/control_my_monitor.html"
   else
     if [[ -n "$VIA_HOST" ]]; then
       via_preflight
@@ -515,6 +556,8 @@ need_opt_arg() {
 platform_label() {
   if [[ -n "$VIA_HOST" ]]; then
     printf 'macOS → %s (SSH)' "$VIA_HOST"
+  elif is_windows; then
+    printf 'Windows (local)'
   elif [[ "$(uname -s)" == "Darwin" ]]; then
     printf 'macOS (local)'
   else
@@ -594,6 +637,9 @@ dry_run_command() {
     input_cmd="$(profile_m1ddc_input_cmd)"
     m1_val="$(input_m1ddc_value "$alias")"
     printf 'm1ddc display %s set %s %s' "$display" "$input_cmd" "$m1_val"
+  elif [[ "$backend" == "cmm" ]]; then
+    printf '%s /SetValue %s %s %s' "$(find_cmm 2>/dev/null || echo ControlMyMonitor.exe)" \
+      "${CMM_MONITOR:-Primary}" "$VCP_INPUT" "$(input_m1ddc_value "$alias")"
   else
     display="$(profile_ddcutil_display)"
     hex="$(input_hex "$alias")"
@@ -613,6 +659,8 @@ backend_switch() {
     input_cmd="$(profile_m1ddc_input_cmd)"
     val="$(input_m1ddc_value "$alias")"
     m1ddc_cmd set "$input_cmd" "$val"
+  elif [[ "$backend" == "cmm" ]]; then
+    cmm_switch "$alias"
   else
     local hex
     hex="$(input_hex "$alias")"
@@ -621,6 +669,9 @@ backend_switch() {
 }
 
 cmd_current() {
+  if is_windows && [[ -z "$VIA_HOST" ]]; then
+    die "current is not supported on Windows (switch only). Use: $SCRIPT_NAME dp1"
+  fi
   require_backend
   local backend; backend="$(get_backend)"
   local profiles=()
@@ -773,6 +824,14 @@ cmd_detect() {
   require_backend
   local backend; backend="$(get_backend)"
   printf "\n"
+  if [[ "$backend" == "cmm" ]]; then
+    info "Windows / ControlMyMonitor"
+    printf "\n"
+    info "Monitor: ${CMM_MONITOR:-Primary}  (change with CMM_MONITOR in config)"
+    info "Download: https://www.nirsoft.net/utils/control_my_monitor.html"
+    printf "\n"
+    return
+  fi
   info "Detected displays (${backend}):"
   printf "\n"
   if [[ "$backend" == "m1ddc" ]]; then
@@ -904,9 +963,10 @@ ${BOLD}REMOTE SETUP${RESET} (for --via)
   # on Ubuntu: sudo apt install ddcutil  (or sync this repo)
 
 ${BOLD}BACKENDS${RESET}
-  macOS (local)       m1ddc     brew install m1ddc
-  Linux (local)       ddcutil   apt install ddcutil
-  macOS --via HOST    ddcutil   on the remote Linux machine
+  macOS (local)       m1ddc               brew install m1ddc
+  Linux (local)       ddcutil             apt install ddcutil
+  Windows (local)     ControlMyMonitor    nirsoft.net/utils/control_my_monitor.html
+  --via HOST          ddcutil             on remote Linux host
 
 ${BOLD}CONFIG${RESET}  ${SCRIPT_DIR}/monitor-input.conf
 EOF

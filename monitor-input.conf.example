@@ -24,6 +24,11 @@ DDCUTIL_DISPLAY_LG=2
 
 VCP_INPUT=60
 
+# ── Windows (Git Bash) — switch only via ControlMyMonitor ─────────────────────
+# Download: https://www.nirsoft.net/utils/control_my_monitor.html
+# CONTROLMYMONITOR_PATH="$HOME/ControlMyMonitor/ControlMyMonitor.exe"
+# CMM_MONITOR="Primary"                    # or "\\.\DISPLAY1\Monitor0"
+
 # ── Remote setup (--via from Mac) ─────────────────────────────────────────────
 # 1. Passwordless SSH — run --via in a terminal; the script offers ssh-copy-id
 # 2. On Ubuntu: ./install.sh  and  ./setup-i2c-permissions.sh
