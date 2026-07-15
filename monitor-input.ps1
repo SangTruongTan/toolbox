@@ -1,11 +1,9 @@
 # monitor-input.ps1 — Switch monitor input on Windows (ControlMyMonitor)
 #
 # Setup:
-#   1. Download ControlMyMonitor: https://www.nirsoft.net/utils/control_my_monitor.html
-#   2. Set $CmmPath below (or env MONITOR_CMM_PATH)
+#   1. Download ControlMyMonitor to ~\dev\controlmymonitor\
+#   2. Override path with env MONITOR_CMM_PATH if needed
 #   3. Run: .\monitor-input.ps1 dp2
-#
-# Inputs: dp1, dp2, hdmi1, hdmi2, usbc
 
 param(
     [Parameter(Position = 0)]
@@ -14,7 +12,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CmmPath = if ($env:MONITOR_CMM_PATH) { $env:MONITOR_CMM_PATH } else { "$env:USERPROFILE\ControlMyMonitor\ControlMyMonitor.exe" }
+$CmmPath = if ($env:MONITOR_CMM_PATH) { $env:MONITOR_CMM_PATH } else { "$env:USERPROFILE\dev\controlmymonitor\ControlMyMonitor.exe" }
 $Monitor = if ($env:MONITOR_CMM_MONITOR) { $env:MONITOR_CMM_MONITOR } else { 'Primary' }
 $VcpInput = 60
 
